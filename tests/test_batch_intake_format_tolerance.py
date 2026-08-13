@@ -93,3 +93,28 @@ def test_end_to_end_format_tolerance_fixtures() -> None:
     # Headerless surfaces a file-level parse error.
     with pytest.raises(BatchParseError):
         process_batch(FIXTURES / "headerless.csv")
+
+
+def test_oversized_field_raises_batch_parse_error_not_csv_error(
+    tmp_path: Path,
+) -> None:
+    """A field exceeding csv.field_size_limit surfaces as BatchParseError.
+
+    Without the catch in _read_rows, csv.DictReader raises a bare csv.Error
+    out of process_batch and crashes the run. The pipeline must wrap it as a
+    file-level BatchParseError, consistent with the delimiter-detection path.
+    """
+    import csv as _csv
+
+    limit = _csv.field_size_limit()
+    # A field comfortably larger than the limit (default 128 KiB).
+    oversized = "x" * (limit + 1024)
+    input_file = tmp_path / "oversized.csv"
+    input_file.write_text(
+        f"customer_id,region,email,phone,notes\n1,EMEA,a@b.com,+44 20,{oversized}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BatchParseError) as exc_info:
+        process_batch(input_file)
+    assert "CSV read error" in str(exc_info.value)

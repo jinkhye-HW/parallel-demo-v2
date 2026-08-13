@@ -345,7 +345,14 @@ def _read_rows(csv_text: str) -> list[dict[str, str | None]]:
         raise BatchParseError(
             f"file has {len(fieldnames_list)} columns; cap is {MAX_COLUMNS}"
         )
-    return list(reader)
+    try:
+        return list(reader)
+    except csv.Error as exc:
+        # A field exceeding csv.field_size_limit (default 128 KiB) raises
+        # csv.Error mid-iteration. Surface it as a file-level parse error
+        # consistent with the delimiter-detection path, rather than crashing
+        # process_batch with a bare csv.Error.
+        raise BatchParseError(f"CSV read error: {exc}") from exc
 
 
 def _parse_records(contents: str) -> list[Record]:
@@ -498,20 +505,46 @@ def _serialize_batch(records: list[Record], summary: Summary) -> dict[str, objec
     }
 
 
+def _quarantine_reserved_in_extra(extra: dict[str, str]) -> dict[str, str]:
+    """Move any reserved field names found as keys in ``extra`` to ``__conflict``.
+
+    A tampered cache (or a future serializer change) could place a reserved
+    name (``validation_status`` / ``errors`` / ``extra``) directly into
+    ``extra``. Re-assert the ADR-0001 quarantine on load so the
+    security-critical boundary is never read from disk as trusted.
+    """
+    cleaned: dict[str, str] = {}
+    for name, value in extra.items():
+        if name in RESERVED_FIELDS:
+            cleaned[f"{name}__conflict"] = value
+        else:
+            cleaned[name] = value
+    return cleaned
+
+
+def _revalidate_cached_record(r: dict[str, Any]) -> Record:
+    """Rebuild a :class:`Record` from cached JSON, recomputing the verdict.
+
+    The cached ``validation_status`` / ``errors`` are NOT trusted: an attacker
+    who can write into the cache directory could plant ``validation_status:
+    "valid"`` on a record with a bad email. We re-run the pipeline's field
+    validation on the cached raw fields so the verdict is always computed by
+    the pipeline, never read from disk. Reserved field names in ``extra`` are
+    re-quarantined under ``<name>__conflict`` (ADR 0001).
+    """
+    extra = _quarantine_reserved_in_extra(dict(r["extra"]))
+    values = {
+        "customer_id": r["customer_id"],
+        "region": r["region"],
+        "email": r["email"],
+        "phone": r["phone"],
+        "notes": r["notes"],
+    }
+    return _validate_record(values, extra)
+
+
 def _deserialize_batch(data: dict[str, Any]) -> tuple[list[Record], Summary]:
-    records: list[Record] = [
-        Record(
-            customer_id=r["customer_id"],
-            region=r["region"],
-            email=r["email"],
-            phone=r["phone"],
-            notes=r["notes"],
-            validation_status=r["validation_status"],
-            errors=list(r["errors"]),
-            extra=dict(r["extra"]),
-        )
-        for r in data["records"]
-    ]
+    records: list[Record] = [_revalidate_cached_record(r) for r in data["records"]]
     s = data["summary"]
     summary = Summary(
         total_records=s["total_records"],

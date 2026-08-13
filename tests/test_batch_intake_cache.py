@@ -188,6 +188,75 @@ def test_raw_contents_source_is_not_cached(tmp_path: Path) -> None:
     assert not cache_dir.exists() or not any(cache_dir.iterdir())
 
 
+def test_tampered_cache_recomputed_verdict_wins(tmp_path: Path) -> None:
+    """A tampered cache file must NOT be trusted for validation_status / errors.
+
+    An attacker who can write into the cache directory could plant
+    ``validation_status: "valid"`` on a record with a bad email, and inject a
+    reserved name into ``extra`` to defeat the ADR-0001 quarantine. On a cache
+    hit the pipeline must recompute the verdict from the cached raw fields and
+    re-quarantine reserved names, so the on-disk verdict is irrelevant.
+    """
+    input_file = _write_input(tmp_path)
+    cache_dir = tmp_path / "cache"
+
+    # Build a tampered cache payload by hand: one record with a bad email but
+    # validation_status forced to "valid", and a reserved name ("errors")
+    # planted directly in extra.
+    key = hashlib.sha256(CSV.encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"{key}.json"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tampered = {
+        "records": [
+            {
+                "customer_id": "79927398713",
+                "region": "EMEA",
+                "email": "not-an-email",
+                "phone": "442079460958",
+                "notes": "hello",
+                "validation_status": "valid",  # planted lie
+                "errors": [],  # planted lie
+                "extra": {
+                    "errors": "injected reserved name",  # reserved name in extra
+                    "partner_col": "ok",
+                },
+            },
+            {
+                "customer_id": "79927398710",
+                "region": "APAC",
+                "email": "bob@example.com",
+                "phone": "6561234567",
+                "notes": "world",
+                "validation_status": "valid",
+                "errors": [],
+                "extra": {},
+            },
+        ],
+        "summary": {
+            "total_records": 2,
+            "valid_count": 2,  # planted lie
+            "invalid_count": 0,
+            "checksum_valid_count": 2,
+            "per_region": [
+                {"name": "EMEA", "records": 1, "valid": 1, "invalid": 0},
+                {"name": "APAC", "records": 1, "valid": 1, "invalid": 0},
+            ],
+        },
+    }
+    cache_file.write_text(json.dumps(tampered), encoding="utf-8")
+
+    result = process_batch(input_file, cache_dir=cache_dir)
+
+    # The recomputed verdict wins: the bad-email record is invalid.
+    bad = result.records[0]
+    assert bad.validation_status == "invalid"
+    assert any("not a valid email" in e for e in bad.errors)
+    # The reserved name in extra is quarantined under __conflict.
+    assert "errors" not in bad.extra
+    assert bad.extra["errors__conflict"] == "injected reserved name"
+    assert bad.extra["partner_col"] == "ok"
+
+
 def test_end_to_end_cache_hit_miss_and_template_variation(tmp_path: Path) -> None:
     input_file = _write_input(tmp_path)
     cache_dir = tmp_path / "cache"
