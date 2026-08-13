@@ -1,0 +1,6 @@
+customer_id,region,email,phone,notes
+79927398713,EMEA,alice@example.com,+44 20 7946 0958,ok
+79927398710,EMEA,bad-email,+44 20 7946 0958,ok
+18,APAC,bob@example.com,+65 6123 4567,ok
+19,APAC,carol@example.com,+1 415 555 0142,ok
+26,AMER,dave@example.com,+44 20 7946 0958,ok

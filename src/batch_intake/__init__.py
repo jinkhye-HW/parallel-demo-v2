@@ -9,6 +9,7 @@ from batch_intake.pipeline import (
     BatchParseError,
     BatchResult,
     Record,
+    RegionStat,
     Summary,
     process_batch,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "BatchParseError",
     "BatchResult",
     "Record",
+    "RegionStat",
     "Summary",
     "process_batch",
 ]

@@ -6,6 +6,8 @@ import csv
 import os
 import re
 import unicodedata
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -62,7 +64,15 @@ DEFAULT_TEMPLATE = (
     "total_records: {{total_records}}\n"
     "valid_count: {{valid_count}}\n"
     "invalid_count: {{invalid_count}}\n"
+    "checksum_valid_count: {{checksum_valid_count}}\n"
+    "per_region:\n"
+    "{{#per_region}}  {{name}}: records={{records}} "
+    "valid={{valid}} invalid={{invalid}}\n"
+    "{{/per_region}}"
 )
+
+# A checksum predicate: takes a customer_id string, returns whether it passes.
+ChecksumFn = Callable[[str], bool]
 
 
 @dataclass(frozen=True)
@@ -80,12 +90,31 @@ class Record:
 
 
 @dataclass(frozen=True)
+class RegionStat:
+    """Per-region breakdown of record counts.
+
+    ``valid`` / ``invalid`` mirror the record's ``validation_status`` (the
+    field-validation verdict), not the ID checksum. One entry per region
+    present in the batch, in first-appearance order.
+    """
+
+    name: str
+    records: int
+    valid: int
+    invalid: int
+
+
+@dataclass(frozen=True)
 class Summary:
     """Aggregate counts across the parsed batch."""
 
     total_records: int
     valid_count: int
     invalid_count: int
+    # How many records' ``customer_id`` passed the (pluggable) checksum.
+    checksum_valid_count: int
+    # One entry per region present in the batch, in first-appearance order.
+    per_region: list[RegionStat]
 
 
 @dataclass(frozen=True)
@@ -348,18 +377,56 @@ def _parse_section_grouped(contents: str) -> list[Record]:
     return records
 
 
-def _summarise(records: list[Record]) -> Summary:
+def _luhn_valid(customer_id: str) -> bool:
+    """Return True if ``customer_id`` passes the Luhn checksum.
+
+    Non-digit characters are ignored; an empty digit run is not valid. The
+    algorithm is linear in the length of the id (one pass, no backtracking),
+    so a long partner-supplied id cannot hang the check.
+    """
+    digits = [int(ch) for ch in customer_id if "0" <= ch <= "9"]
+    if not digits:
+        return False
+    total = 0
+    for i, digit in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def _summarise(records: list[Record], checksum: ChecksumFn) -> Summary:
     valid_count = sum(1 for r in records if r.validation_status == "valid")
+
+    # One entry per region in first-appearance order; OrderedDict preserves it.
+    regions: OrderedDict[str, dict[str, int]] = OrderedDict()
+    for r in records:
+        stat = regions.setdefault(r.region, {"records": 0, "valid": 0, "invalid": 0})
+        stat["records"] += 1
+        if r.validation_status == "valid":
+            stat["valid"] += 1
+        else:
+            stat["invalid"] += 1
+    per_region = [
+        RegionStat(name=name, **counts) for name, counts in regions.items()
+    ]
+
     return Summary(
         total_records=len(records),
         valid_count=valid_count,
         invalid_count=len(records) - valid_count,
+        checksum_valid_count=sum(1 for r in records if checksum(r.customer_id)),
+        per_region=per_region,
     )
 
 
 def process_batch(
     source: str | os.PathLike[str],
     template: str | None = None,
+    *,
+    checksum: ChecksumFn | None = None,
 ) -> BatchResult:
     """Parse a partner batch file and render its summary report.
 
@@ -368,21 +435,37 @@ def process_batch(
             points at an existing file is read from disk; anything else is
             treated as the CSV text itself.
         template: Optional mustache template with scalar placeholders
-            (``{{total_records}}``, ``{{valid_count}}``, ``{{invalid_count}}``).
+            (``{{total_records}}``, ``{{valid_count}}``, ``{{invalid_count}}``,
+            ``{{checksum_valid_count}}``) and a ``{{#per_region}}`` section
+            (``{{name}}``, ``{{records}}``, ``{{valid}}``, ``{{invalid}}``).
             Defaults to a built-in summary template.
+        checksum: Optional predicate ``customer_id -> bool`` used to validate
+            each record's ``customer_id`` for ``checksum_valid_count``. Defaults
+            to the Luhn algorithm. Supply a callable so a partner's real rule
+            drops in without code changes.
 
     Returns:
         The parsed records, summary stats, and rendered report.
     """
     contents = _load_contents(source)
     records = _parse_records(contents)
-    summary = _summarise(records)
+    summary = _summarise(records, checksum or _luhn_valid)
     report = chevron.render(
         template or DEFAULT_TEMPLATE,
         {
             "total_records": summary.total_records,
             "valid_count": summary.valid_count,
             "invalid_count": summary.invalid_count,
+            "checksum_valid_count": summary.checksum_valid_count,
+            "per_region": [
+                {
+                    "name": r.name,
+                    "records": r.records,
+                    "valid": r.valid,
+                    "invalid": r.invalid,
+                }
+                for r in summary.per_region
+            ],
         },
     )
     return BatchResult(records=records, summary=summary, report=report)
