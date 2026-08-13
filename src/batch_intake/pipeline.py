@@ -100,13 +100,20 @@ class BatchResult:
 def _load_contents(source: str | os.PathLike[str]) -> str:
     """Read ``source`` as file contents.
 
-    If ``source`` points at an existing file, read it as UTF-8 text. Otherwise
-    treat it as raw CSV contents. This keeps the public entry point a single
-    function that accepts a path or contents, per the ticket.
+    If ``source`` points at an existing file, read it as UTF-8 text (BOM-tolerant
+    via ``utf-8-sig``); on a :class:`UnicodeDecodeError` fall back to decoding
+    with ``errors="replace"`` so a mixed-encoding partner file never raises at
+    the I/O boundary. Otherwise treat ``source`` as raw CSV contents. This keeps
+    the public entry point a single function that accepts a path or contents,
+    per the ticket.
     """
     candidate = Path(os.fspath(source))
     if candidate.is_file():
-        return candidate.read_text(encoding="utf-8")
+        data = candidate.read_bytes()
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return data.decode("utf-8-sig", errors="replace")
     return os.fspath(source)
 
 
@@ -195,19 +202,149 @@ def _partition_row(
     return values, extra
 
 
-def _parse_records(contents: str) -> list[Record]:
-    reader = csv.DictReader(StringIO(contents))
+# Delimiters the sniffer may choose between. Restricted so a stray character in
+# the data is not mistaken for a delimiter; comma is the default.
+_CANDIDATE_DELIMITERS = ",\t;|"
+
+
+def _detect_delimiter(contents: str) -> str:
+    """Auto-detect the CSV delimiter, defaulting to comma when uncertain.
+
+    Uses :class:`csv.Sniffer` on a leading sample. If the sample is too short
+    or the sniffer cannot determine a delimiter, comma is returned so a
+    well-formed comma file still parses.
+    """
+    sample = contents[:2048]
+    if not sample:
+        return ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=_CANDIDATE_DELIMITERS)
+    except csv.Error:
+        return ","
+    return dialect.delimiter
+
+
+def _looks_like_data_value(value: str) -> bool:
+    """Heuristic: does ``value`` look like record data, not a column name?
+
+    Column names are identifiers; record data carries an email (``@``), a phone
+    (leading ``+``), or a purely-numeric id. Used to detect a headerless file
+    whose first row :class:`csv.DictReader` would otherwise treat as the header.
+    """
+    if "@" in value:
+        return True
+    if value.startswith("+"):
+        return True
+    if value and all("0" <= ch <= "9" for ch in value):
+        return True
+    return False
+
+
+def _is_headerless(fieldnames: list[str]) -> bool:
+    """Return True if the header row looks like a data row (no header).
+
+    A real partner header carries at least one known schema column name. If none
+    of the fieldnames match the schema and at least one looks like a data value
+    (email, phone, numeric id), the file is headerless and would be silently
+    positionally mis-parsed by :class:`csv.DictReader`.
+    """
+    if any(name in SCHEMA_FIELDS for name in fieldnames):
+        return False
+    return any(_looks_like_data_value(name) for name in fieldnames)
+
+
+def _is_section_grouped(contents: str) -> bool:
+    """Return True if ``contents`` is a section-grouped CSV.
+
+    A section-grouped file's first non-blank line is a bare region label (a
+    single field with no delimiter) and the following line is a CSV header (it
+    contains a delimiter). A normal CSV's first line is the header itself, which
+    contains a delimiter.
+    """
+    lines = [ln for ln in contents.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    first_has_delim = any(d in lines[0] for d in _CANDIDATE_DELIMITERS)
+    second_has_delim = any(d in lines[1] for d in _CANDIDATE_DELIMITERS)
+    return not first_has_delim and second_has_delim
+
+
+def _split_sections(contents: str) -> list[list[str]]:
+    """Split section-grouped contents into sections of non-blank lines.
+
+    Sections are separated by one or more blank lines. Within a section, the
+    first line is the region label and the rest is a CSV with its own header.
+    """
+    sections: list[list[str]] = []
+    current: list[str] = []
+    for line in contents.splitlines():
+        if line.strip():
+            current.append(line)
+        else:
+            if current:
+                sections.append(current)
+                current = []
+    if current:
+        sections.append(current)
+    return sections
+
+
+def _read_rows(csv_text: str) -> list[dict[str, str | None]]:
+    """Read ``csv_text`` with an auto-detected delimiter.
+
+    Returns the rows. Raises :class:`BatchParseError` if the file is headerless
+    or exceeds the column cap.
+    """
+    delimiter = _detect_delimiter(csv_text)
+    reader = csv.DictReader(StringIO(csv_text), delimiter=delimiter)
     fieldnames = reader.fieldnames
     if fieldnames is None:
         return []
-    if len(fieldnames) > MAX_COLUMNS:
+    fieldnames_list = list(fieldnames)
+    if _is_headerless(fieldnames_list):
         raise BatchParseError(
-            f"file has {len(fieldnames)} columns; cap is {MAX_COLUMNS}"
+            "headerless file: first row has no recognized column names"
         )
+    if len(fieldnames_list) > MAX_COLUMNS:
+        raise BatchParseError(
+            f"file has {len(fieldnames_list)} columns; cap is {MAX_COLUMNS}"
+        )
+    return list(reader)
+
+
+def _parse_records(contents: str) -> list[Record]:
+    if _is_section_grouped(contents):
+        return _parse_section_grouped(contents)
+    return _parse_flat(contents)
+
+
+def _parse_flat(contents: str) -> list[Record]:
     records: list[Record] = []
-    for row in reader:
+    for row in _read_rows(contents):
         values, extra = _partition_row(row)
         records.append(_validate_record(values, extra))
+    return records
+
+
+def _parse_section_grouped(contents: str) -> list[Record]:
+    """Parse a section-grouped CSV into a flat record list with ``region``.
+
+    Each section is a region label line followed by a CSV with its own header.
+    The label is preserved as the ``region`` field on every record in that
+    section, overriding any ``region`` column in the section's header (the
+    grouping is the source of truth for region).
+    """
+    records: list[Record] = []
+    for section in _split_sections(contents):
+        if len(section) < 2:
+            # A label with no header/data yields no records.
+            continue
+        region = section[0].strip()
+        csv_text = "\n".join(section[1:])
+        for row in _read_rows(csv_text):
+            values, extra = _partition_row(row)
+            values["region"] = region
+            records.append(_validate_record(values, extra))
     return records
 
 

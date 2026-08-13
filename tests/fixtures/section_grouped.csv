@@ -1,0 +1,8 @@
+EMEA
+customer_id,email,phone,notes
+1001,alice@example.com,+44 20 7946 0958,prefers email
+1002,bob@example.com,+65 6123 4567,vip
+
+APAC
+customer_id,email,phone,notes
+1003,carol@example.com,+1 415 555 0142,
