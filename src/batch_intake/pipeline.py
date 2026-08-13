@@ -409,9 +409,7 @@ def _summarise(records: list[Record], checksum: ChecksumFn) -> Summary:
             stat["valid"] += 1
         else:
             stat["invalid"] += 1
-    per_region = [
-        RegionStat(name=name, **counts) for name, counts in regions.items()
-    ]
+    per_region = [RegionStat(name=name, **counts) for name, counts in regions.items()]
 
     return Summary(
         total_records=len(records),
@@ -434,11 +432,15 @@ def process_batch(
         source: Path to a UTF-8 CSV file, or raw CSV contents. A string that
             points at an existing file is read from disk; anything else is
             treated as the CSV text itself.
-        template: Optional mustache template with scalar placeholders
+        template: Optional mustache template. Scalar placeholders
             (``{{total_records}}``, ``{{valid_count}}``, ``{{invalid_count}}``,
-            ``{{checksum_valid_count}}``) and a ``{{#per_region}}`` section
-            (``{{name}}``, ``{{records}}``, ``{{valid}}``, ``{{invalid}}``).
-            Defaults to a built-in summary template.
+            ``{{checksum_valid_count}}``) are substituted; ``{{#per_region}}`` loops
+            over per-region stats (``{{name}}``, ``{{records}}``, ``{{valid}}``,
+            ``{{invalid}}``); ``{{#records}}`` loops over records (``{{customer_id}}``,
+            ``{{region}}``, ``{{email}}``, ``{{phone}}``, ``{{notes}}``,
+            ``{{validation_status}}``, ``{{errors}}``, ``{{extra}}``, plus ``{{valid}}``
+            / ``{{invalid}}`` conditionals). ``{{field}}`` HTML-escapes; ``{{{field}}}``
+            outputs raw. Defaults to a built-in summary template.
         checksum: Optional predicate ``customer_id -> bool`` used to validate
             each record's ``customer_id`` for ``checksum_valid_count``. Defaults
             to the Luhn algorithm. Supply a callable so a partner's real rule
@@ -465,6 +467,26 @@ def process_batch(
                     "invalid": r.invalid,
                 }
                 for r in summary.per_region
+            ],
+            # One entry per record so templates can loop with
+            # {{#records}}...{{/records}}. ``valid`` / ``invalid`` are derived
+            # booleans for conditional sections (e.g. {{#invalid}}...{{/invalid}});
+            # the remaining fields mirror the Record dataclass so the template
+            # sees exactly what the pipeline carries.
+            "records": [
+                {
+                    "customer_id": r.customer_id,
+                    "region": r.region,
+                    "email": r.email,
+                    "phone": r.phone,
+                    "notes": r.notes,
+                    "validation_status": r.validation_status,
+                    "errors": list(r.errors),
+                    "extra": dict(r.extra),
+                    "valid": r.validation_status == "valid",
+                    "invalid": r.validation_status == "invalid",
+                }
+                for r in records
             ],
         },
     )
