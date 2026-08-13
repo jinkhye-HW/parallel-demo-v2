@@ -16,7 +16,7 @@ import chevron
 ValidationStatus = Literal["valid", "invalid"]
 
 # Canonical schema fields the pipeline knows about. Unknown partner columns are
-# ignored in this slice (see ADR 0001 for the eventual `extra` namespacing).
+# namespaced under `extra` (see ADR 0001).
 SCHEMA_FIELDS: tuple[str, ...] = (
     "customer_id",
     "region",
@@ -24,6 +24,25 @@ SCHEMA_FIELDS: tuple[str, ...] = (
     "phone",
     "notes",
 )
+
+# Pipeline-owned field names. A partner column colliding with one of these is
+# quarantined into `extra` under a `<name>__conflict` key so the CSV cannot
+# overwrite the pipeline's computed verdict (ADR 0001, security-critical).
+RESERVED_FIELDS: tuple[str, ...] = ("validation_status", "errors", "extra")
+
+# A file with more than this many columns surfaces a file-level parse error.
+MAX_COLUMNS = 64
+
+
+class BatchParseError(Exception):
+    """File-level parse error surfaced to the caller.
+
+    Distinct from a record-level ``invalid`` validation status: the file
+    itself could not be parsed (e.g. it exceeds the column cap), so no
+    records are produced. Raised from :func:`process_batch` for the caller
+    to catch.
+    """
+
 
 # Pinned linear email pattern: no nested or overlapping quantifiers, so it is
 # ReDoS-safe on partner-controlled text. Do not substitute a backtracking-prone
@@ -125,7 +144,7 @@ def _clean_notes(notes: str) -> str:
     return stripped[:NOTES_MAX_LENGTH]
 
 
-def _validate_record(values: dict[str, str]) -> Record:
+def _validate_record(values: dict[str, str], extra: dict[str, str]) -> Record:
     errors: list[str] = []
     errors.extend(_validate_email(values["email"]))
     phone_digits, phone_errors = _normalize_phone(values["phone"])
@@ -139,16 +158,56 @@ def _validate_record(values: dict[str, str]) -> Record:
         notes=notes,
         validation_status="invalid" if errors else "valid",
         errors=errors,
-        extra={},
+        extra=extra,
     )
+
+
+def _partition_row(
+    row: dict[str, str | None],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Split a CSV row into schema values and the ``extra`` dict.
+
+    Schema fields go into the values dict. Reserved field names
+    (``validation_status``, ``errors``, ``extra``) are quarantined into
+    ``extra`` under ``<name>__conflict`` keys so a partner CSV cannot
+    overwrite the pipeline's computed fields (ADR 0001). Any other unknown
+    column is namespaced into ``extra`` under its own name. Unknown columns
+    are never flat-merged onto the record.
+    """
+    values: dict[str, str] = {}
+    extra: dict[str, str] = {}
+    for name, raw in row.items():
+        if name is None:
+            # DictReader yields a None key for surplus columns in rows that
+            # have more fields than the header; there is no column name to
+            # namespace under, so skip the surplus value.
+            continue
+        value = raw or ""
+        if name in SCHEMA_FIELDS:
+            values[name] = value
+        elif name in RESERVED_FIELDS:
+            extra[f"{name}__conflict"] = value
+        else:
+            extra[name] = value
+    # Ensure every schema field is present even if missing from the header.
+    for name in SCHEMA_FIELDS:
+        values.setdefault(name, "")
+    return values, extra
 
 
 def _parse_records(contents: str) -> list[Record]:
     reader = csv.DictReader(StringIO(contents))
+    fieldnames = reader.fieldnames
+    if fieldnames is None:
+        return []
+    if len(fieldnames) > MAX_COLUMNS:
+        raise BatchParseError(
+            f"file has {len(fieldnames)} columns; cap is {MAX_COLUMNS}"
+        )
     records: list[Record] = []
     for row in reader:
-        values = {name: (row.get(name) or "") for name in SCHEMA_FIELDS}
-        records.append(_validate_record(values))
+        values, extra = _partition_row(row)
+        records.append(_validate_record(values, extra))
     return records
 
 
