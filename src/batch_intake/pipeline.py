@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
 import re
 import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import StringIO
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import chevron
 
@@ -34,6 +36,11 @@ RESERVED_FIELDS: tuple[str, ...] = ("validation_status", "errors", "extra")
 
 # A file with more than this many columns surfaces a file-level parse error.
 MAX_COLUMNS = 64
+
+# Default cache directory name, placed alongside the input file. The cache
+# location is configurable via ``process_batch``'s ``cache_dir`` argument; this
+# is the conventional default (see ADR 0001 / ticket #14).
+DEFAULT_CACHE_DIRNAME = ".batch_cache"
 
 
 class BatchParseError(Exception):
@@ -420,11 +427,210 @@ def _summarise(records: list[Record], checksum: ChecksumFn) -> Summary:
     )
 
 
+# --- Disk cache (parsed records + summary only) ---------------------------
+#
+# The cache key is the SHA-256 of the input file's contents; the cache file is
+# ``<cache_dir>/<sha256_hex>.json``. On a hit (the key's file is present) the
+# parsed records and summary are loaded from disk and parsing is skipped; on a
+# miss (file changed -> new hash -> new filename) the file is re-parsed and a
+# new cache entry written. The cache stores records + summary only; the report
+# is always rendered fresh against the call's template. The cache path is
+# derived from the input file's path (and the caller-supplied ``cache_dir``),
+# never from partner-supplied data (path-traversal guard per
+# practices/security-practice.md).
+
+
+def _as_file_path(source: str | os.PathLike[str]) -> Path | None:
+    """Return ``source`` as a Path if it names an existing file, else None."""
+    candidate = Path(os.fspath(source))
+    return candidate if candidate.is_file() else None
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _cache_file_path(cache_dir: Path, content_hash: str) -> Path:
+    """Resolve the cache file for ``content_hash`` within ``cache_dir``.
+
+    The filename is the hex content hash plus ``.json`` — hex digits carry no
+    path separators, so the entry cannot escape the cache directory. We resolve
+    and check containment anyway as defense-in-depth (a future naming change
+    that introduced separators would fail closed rather than write outside).
+    """
+    root = cache_dir.resolve()
+    target = (root / f"{content_hash}.json").resolve()
+    if not target.is_relative_to(root):
+        raise BatchParseError("cache path escapes cache directory")
+    return target
+
+
+def _serialize_batch(records: list[Record], summary: Summary) -> dict[str, object]:
+    return {
+        "records": [
+            {
+                "customer_id": r.customer_id,
+                "region": r.region,
+                "email": r.email,
+                "phone": r.phone,
+                "notes": r.notes,
+                "validation_status": r.validation_status,
+                "errors": list(r.errors),
+                "extra": dict(r.extra),
+            }
+            for r in records
+        ],
+        "summary": {
+            "total_records": summary.total_records,
+            "valid_count": summary.valid_count,
+            "invalid_count": summary.invalid_count,
+            "checksum_valid_count": summary.checksum_valid_count,
+            "per_region": [
+                {
+                    "name": s.name,
+                    "records": s.records,
+                    "valid": s.valid,
+                    "invalid": s.invalid,
+                }
+                for s in summary.per_region
+            ],
+        },
+    }
+
+
+def _deserialize_batch(data: dict[str, Any]) -> tuple[list[Record], Summary]:
+    records: list[Record] = [
+        Record(
+            customer_id=r["customer_id"],
+            region=r["region"],
+            email=r["email"],
+            phone=r["phone"],
+            notes=r["notes"],
+            validation_status=r["validation_status"],
+            errors=list(r["errors"]),
+            extra=dict(r["extra"]),
+        )
+        for r in data["records"]
+    ]
+    s = data["summary"]
+    summary = Summary(
+        total_records=s["total_records"],
+        valid_count=s["valid_count"],
+        invalid_count=s["invalid_count"],
+        checksum_valid_count=s["checksum_valid_count"],
+        per_region=[
+            RegionStat(
+                name=rs["name"],
+                records=rs["records"],
+                valid=rs["valid"],
+                invalid=rs["invalid"],
+            )
+            for rs in s["per_region"]
+        ],
+    )
+    return records, summary
+
+
+def _write_cache(cache_file: Path, records: list[Record], summary: Summary) -> None:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = _serialize_batch(records, summary)
+    cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _read_cache(cache_file: Path) -> tuple[list[Record], Summary]:
+    data = json.loads(cache_file.read_text(encoding="utf-8"))
+    return _deserialize_batch(data)
+
+
+def _load_or_parse(
+    input_path: Path,
+    contents: str,
+    cache_dir: Path,
+    checksum_fn: ChecksumFn,
+) -> tuple[list[Record], Summary]:
+    """Return records + summary, using the disk cache on a content-hash hit.
+
+    On a hit the parsed records and summary are loaded from disk and parsing is
+    skipped; on a miss the file is parsed and the cache written. The cached
+    ``checksum_valid_count`` is recomputed from the loaded records with the
+    call's checksum predicate, so a custom predicate is never stale on a hit.
+    Cache I/O errors are non-fatal: a corrupt or unwritable cache falls back to
+    parsing rather than failing the call.
+    """
+    content_hash = _sha256_hex(input_path.read_bytes())
+    cache_file = _cache_file_path(cache_dir, content_hash)
+
+    cached_records: list[Record] = []
+    cached_summary: Summary | None = None
+    if cache_file.is_file():
+        try:
+            cached_records, cached_summary = _read_cache(cache_file)
+        except (OSError, ValueError, KeyError, TypeError):
+            cached_summary = None
+
+    if cached_summary is not None:
+        summary = replace(
+            cached_summary,
+            checksum_valid_count=sum(
+                1 for r in cached_records if checksum_fn(r.customer_id)
+            ),
+        )
+        return cached_records, summary
+
+    records = _parse_records(contents)
+    summary = _summarise(records, checksum_fn)
+    try:
+        _write_cache(cache_file, records, summary)
+    except OSError:
+        # A failed cache write does not affect the caller's result.
+        pass
+    return records, summary
+
+
+def _template_context(records: list[Record], summary: Summary) -> dict[str, object]:
+    return {
+        "total_records": summary.total_records,
+        "valid_count": summary.valid_count,
+        "invalid_count": summary.invalid_count,
+        "checksum_valid_count": summary.checksum_valid_count,
+        "per_region": [
+            {
+                "name": r.name,
+                "records": r.records,
+                "valid": r.valid,
+                "invalid": r.invalid,
+            }
+            for r in summary.per_region
+        ],
+        # One entry per record so templates can loop with
+        # {{#records}}...{{/records}}. ``valid`` / ``invalid`` are derived
+        # booleans for conditional sections (e.g. {{#invalid}}...{{/invalid}});
+        # the remaining fields mirror the Record dataclass so the template
+        # sees exactly what the pipeline carries.
+        "records": [
+            {
+                "customer_id": r.customer_id,
+                "region": r.region,
+                "email": r.email,
+                "phone": r.phone,
+                "notes": r.notes,
+                "validation_status": r.validation_status,
+                "errors": list(r.errors),
+                "extra": dict(r.extra),
+                "valid": r.validation_status == "valid",
+                "invalid": r.validation_status == "invalid",
+            }
+            for r in records
+        ],
+    }
+
+
 def process_batch(
     source: str | os.PathLike[str],
     template: str | None = None,
     *,
     checksum: ChecksumFn | None = None,
+    cache_dir: Path | None = None,
 ) -> BatchResult:
     """Parse a partner batch file and render its summary report.
 
@@ -445,49 +651,39 @@ def process_batch(
             each record's ``customer_id`` for ``checksum_valid_count``. Defaults
             to the Luhn algorithm. Supply a callable so a partner's real rule
             drops in without code changes.
+        cache_dir: Optional directory for the parsed-batch disk cache. When
+            ``source`` is an existing file, the parsed records and summary are
+            cached as JSON keyed by the SHA-256 of the file's contents: a re-run
+            on an unchanged file loads from cache and skips parsing, a changed
+            file is re-parsed and the cache overwritten. The report is always
+            rendered fresh against this call's template, so a cached file reused
+            with a different template returns the correct report. When ``None``
+            (the default) the cache lives in :data:`DEFAULT_CACHE_DIRNAME`
+            (``.batch_cache``) alongside the input file; pass a path to use a
+            different location. The cache path is derived from the input file's
+            path and ``cache_dir``, never from partner-supplied data. Caching
+            applies only when ``source`` is a file path (raw CSV contents are
+            never cached).
 
     Returns:
         The parsed records, summary stats, and rendered report.
     """
     contents = _load_contents(source)
-    records = _parse_records(contents)
-    summary = _summarise(records, checksum or _luhn_valid)
+    checksum_fn = checksum or _luhn_valid
+
+    input_path = _as_file_path(source)
+    if input_path is not None:
+        root = (
+            cache_dir
+            if cache_dir is not None
+            else (input_path.parent / DEFAULT_CACHE_DIRNAME)
+        )
+        records, summary = _load_or_parse(input_path, contents, root, checksum_fn)
+    else:
+        records = _parse_records(contents)
+        summary = _summarise(records, checksum_fn)
+
     report = chevron.render(
-        template or DEFAULT_TEMPLATE,
-        {
-            "total_records": summary.total_records,
-            "valid_count": summary.valid_count,
-            "invalid_count": summary.invalid_count,
-            "checksum_valid_count": summary.checksum_valid_count,
-            "per_region": [
-                {
-                    "name": r.name,
-                    "records": r.records,
-                    "valid": r.valid,
-                    "invalid": r.invalid,
-                }
-                for r in summary.per_region
-            ],
-            # One entry per record so templates can loop with
-            # {{#records}}...{{/records}}. ``valid`` / ``invalid`` are derived
-            # booleans for conditional sections (e.g. {{#invalid}}...{{/invalid}});
-            # the remaining fields mirror the Record dataclass so the template
-            # sees exactly what the pipeline carries.
-            "records": [
-                {
-                    "customer_id": r.customer_id,
-                    "region": r.region,
-                    "email": r.email,
-                    "phone": r.phone,
-                    "notes": r.notes,
-                    "validation_status": r.validation_status,
-                    "errors": list(r.errors),
-                    "extra": dict(r.extra),
-                    "valid": r.validation_status == "valid",
-                    "invalid": r.validation_status == "invalid",
-                }
-                for r in records
-            ],
-        },
+        template or DEFAULT_TEMPLATE, _template_context(records, summary)
     )
     return BatchResult(records=records, summary=summary, report=report)
