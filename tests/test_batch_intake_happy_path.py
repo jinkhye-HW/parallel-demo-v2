@@ -20,7 +20,7 @@ def test_valid_csv_round_trips_through_public_entry_point() -> None:
     assert result.records[0].customer_id == "1001"
     assert result.records[0].region == "EMEA"
     assert result.records[0].email == "alice@example.com"
-    assert result.records[0].phone == "+44 20 7946 0958"
+    assert result.records[0].phone == "442079460958"
     assert result.records[0].notes == "prefers email"
     assert result.records[2].notes == ""
 

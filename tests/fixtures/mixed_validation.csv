@@ -1,0 +1,4 @@
+customer_id,region,email,phone,notes
+4001,EMEA,bad-email,+44 20 7946 0958,ok
+4002,APAC,ok@example.com,+12,ok
+4003,AMER,ok2@example.com,+44 20 7946 0958,short

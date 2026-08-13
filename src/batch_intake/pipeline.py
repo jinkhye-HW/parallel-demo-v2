@@ -1,9 +1,11 @@
-"""Happy-path parse, summary, and render for partner batch files."""
+"""Parse, validate, summarise, and render partner batch files."""
 
 from __future__ import annotations
 
 import csv
 import os
+import re
+import unicodedata
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -22,6 +24,19 @@ SCHEMA_FIELDS: tuple[str, ...] = (
     "phone",
     "notes",
 )
+
+# Pinned linear email pattern: no nested or overlapping quantifiers, so it is
+# ReDoS-safe on partner-controlled text. Do not substitute a backtracking-prone
+# pattern (see practices/security-practice.md, "re against untrusted input").
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Phone is stored as the digit run; 7-15 digits are accepted.
+PHONE_MIN_DIGITS = 7
+PHONE_MAX_DIGITS = 15
+
+# Notes are plain text into a text template: capped length, control chars
+# stripped (newline and tab preserved as structural whitespace).
+NOTES_MAX_LENGTH = 10_000
 
 DEFAULT_TEMPLATE = (
     "Batch report\n"
@@ -76,23 +91,64 @@ def _load_contents(source: str | os.PathLike[str]) -> str:
     return os.fspath(source)
 
 
+def _validate_email(email: str) -> list[str]:
+    """Return a list of email error messages (empty if the email is valid)."""
+    if not EMAIL_PATTERN.match(email):
+        return [f"email: {email!r} is not a valid email address"]
+    return []
+
+
+def _normalize_phone(phone: str) -> tuple[str, list[str]]:
+    """Extract digits from ``phone`` and validate the digit count.
+
+    Returns the normalized digit string and a list of error messages. The
+    normalized digits are returned regardless of validity so the record always
+    carries the digit run.
+    """
+    # ASCII digits only: str.isdigit() also accepts Unicode digits (e.g. '٣'),
+    # which would leak non-ASCII characters into the normalized digit string.
+    digits = "".join(ch for ch in phone if "0" <= ch <= "9")
+    errors: list[str] = []
+    if not (PHONE_MIN_DIGITS <= len(digits) <= PHONE_MAX_DIGITS):
+        errors.append(
+            f"phone: must contain {PHONE_MIN_DIGITS} to {PHONE_MAX_DIGITS} digits, "
+            f"got {len(digits)}"
+        )
+    return digits, errors
+
+
+def _clean_notes(notes: str) -> str:
+    """Strip control chars (except ``\\n`` and ``\\t``) and cap the length."""
+    stripped = "".join(
+        ch for ch in notes if ch in ("\n", "\t") or unicodedata.category(ch) != "Cc"
+    )
+    return stripped[:NOTES_MAX_LENGTH]
+
+
+def _validate_record(values: dict[str, str]) -> Record:
+    errors: list[str] = []
+    errors.extend(_validate_email(values["email"]))
+    phone_digits, phone_errors = _normalize_phone(values["phone"])
+    errors.extend(phone_errors)
+    notes = _clean_notes(values["notes"])
+    return Record(
+        customer_id=values["customer_id"],
+        region=values["region"],
+        email=values["email"],
+        phone=phone_digits,
+        notes=notes,
+        validation_status="invalid" if errors else "valid",
+        errors=errors,
+        extra={},
+    )
+
+
 def _parse_records(contents: str) -> list[Record]:
     reader = csv.DictReader(StringIO(contents))
     records: list[Record] = []
     for row in reader:
         values = {name: (row.get(name) or "") for name in SCHEMA_FIELDS}
-        records.append(
-            Record(
-                customer_id=values["customer_id"],
-                region=values["region"],
-                email=values["email"],
-                phone=values["phone"],
-                notes=values["notes"],
-                validation_status="valid",
-                errors=[],
-                extra={},
-            )
-        )
+        records.append(_validate_record(values))
     return records
 
 
