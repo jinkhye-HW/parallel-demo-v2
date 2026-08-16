@@ -1,0 +1,722 @@
+"""Parse, validate, summarise, and render partner batch files."""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import re
+import unicodedata
+from collections import OrderedDict
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from io import StringIO
+from pathlib import Path
+from typing import Any, Literal
+
+import chevron
+
+ValidationStatus = Literal["valid", "invalid"]
+
+# Canonical schema fields the pipeline knows about. Unknown partner columns are
+# namespaced under `extra` (see ADR 0001).
+SCHEMA_FIELDS: tuple[str, ...] = (
+    "customer_id",
+    "region",
+    "email",
+    "phone",
+    "notes",
+)
+
+# Pipeline-owned field names. A partner column colliding with one of these is
+# quarantined into `extra` under a `<name>__conflict` key so the CSV cannot
+# overwrite the pipeline's computed verdict (ADR 0001, security-critical).
+RESERVED_FIELDS: tuple[str, ...] = ("validation_status", "errors", "extra")
+
+# A file with more than this many columns surfaces a file-level parse error.
+MAX_COLUMNS = 64
+
+# Default cache directory name, placed alongside the input file. The cache
+# location is configurable via ``process_batch``'s ``cache_dir`` argument; this
+# is the conventional default (see ADR 0001 / ticket #14).
+DEFAULT_CACHE_DIRNAME = ".batch_cache"
+
+
+class BatchParseError(Exception):
+    """File-level parse error surfaced to the caller.
+
+    Distinct from a record-level ``invalid`` validation status: the file
+    itself could not be parsed (e.g. it exceeds the column cap), so no
+    records are produced. Raised from :func:`process_batch` for the caller
+    to catch.
+    """
+
+
+# Pinned linear email pattern: no nested or overlapping quantifiers, so it is
+# ReDoS-safe on partner-controlled text. Do not substitute a backtracking-prone
+# pattern (see practices/security-practice.md, "re against untrusted input").
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Phone is stored as the digit run; 7-15 digits are accepted.
+PHONE_MIN_DIGITS = 7
+PHONE_MAX_DIGITS = 15
+
+# Notes are plain text into a text template: capped length, control chars
+# stripped (newline and tab preserved as structural whitespace).
+NOTES_MAX_LENGTH = 10_000
+
+DEFAULT_TEMPLATE = (
+    "Batch report\n"
+    "total_records: {{total_records}}\n"
+    "valid_count: {{valid_count}}\n"
+    "invalid_count: {{invalid_count}}\n"
+    "checksum_valid_count: {{checksum_valid_count}}\n"
+    "per_region:\n"
+    "{{#per_region}}  {{name}}: records={{records}} "
+    "valid={{valid}} invalid={{invalid}}\n"
+    "{{/per_region}}"
+)
+
+# A checksum predicate: takes a customer_id string, returns whether it passes.
+ChecksumFn = Callable[[str], bool]
+
+
+@dataclass(frozen=True)
+class Record:
+    """One customer entry parsed from a row of a batch."""
+
+    customer_id: str
+    region: str
+    email: str
+    phone: str
+    notes: str
+    validation_status: ValidationStatus
+    errors: list[str]
+    extra: dict[str, str]
+
+
+@dataclass(frozen=True)
+class RegionStat:
+    """Per-region breakdown of record counts.
+
+    ``valid`` / ``invalid`` mirror the record's ``validation_status`` (the
+    field-validation verdict), not the ID checksum. One entry per region
+    present in the batch, in first-appearance order.
+    """
+
+    name: str
+    records: int
+    valid: int
+    invalid: int
+
+
+@dataclass(frozen=True)
+class Summary:
+    """Aggregate counts across the parsed batch."""
+
+    total_records: int
+    valid_count: int
+    invalid_count: int
+    # How many records' ``customer_id`` passed the (pluggable) checksum.
+    checksum_valid_count: int
+    # One entry per region present in the batch, in first-appearance order.
+    per_region: list[RegionStat]
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """The parsed records, summary stats, and rendered report."""
+
+    records: list[Record]
+    summary: Summary
+    report: str
+
+
+def _load_contents(source: str | os.PathLike[str]) -> str:
+    """Read ``source`` as file contents.
+
+    If ``source`` points at an existing file, read it as UTF-8 text (BOM-tolerant
+    via ``utf-8-sig``); on a :class:`UnicodeDecodeError` fall back to decoding
+    with ``errors="replace"`` so a mixed-encoding partner file never raises at
+    the I/O boundary. Otherwise treat ``source`` as raw CSV contents. This keeps
+    the public entry point a single function that accepts a path or contents,
+    per the ticket.
+    """
+    candidate = Path(os.fspath(source))
+    if candidate.is_file():
+        data = candidate.read_bytes()
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return data.decode("utf-8-sig", errors="replace")
+    return os.fspath(source)
+
+
+def _validate_email(email: str) -> list[str]:
+    """Return a list of email error messages (empty if the email is valid)."""
+    if not EMAIL_PATTERN.match(email):
+        return [f"email: {email!r} is not a valid email address"]
+    return []
+
+
+def _normalize_phone(phone: str) -> tuple[str, list[str]]:
+    """Extract digits from ``phone`` and validate the digit count.
+
+    Returns the normalized digit string and a list of error messages. The
+    normalized digits are returned regardless of validity so the record always
+    carries the digit run.
+    """
+    # ASCII digits only: str.isdigit() also accepts Unicode digits (e.g. '٣'),
+    # which would leak non-ASCII characters into the normalized digit string.
+    digits = "".join(ch for ch in phone if "0" <= ch <= "9")
+    errors: list[str] = []
+    if not (PHONE_MIN_DIGITS <= len(digits) <= PHONE_MAX_DIGITS):
+        errors.append(
+            f"phone: must contain {PHONE_MIN_DIGITS} to {PHONE_MAX_DIGITS} digits, "
+            f"got {len(digits)}"
+        )
+    return digits, errors
+
+
+def _clean_notes(notes: str) -> str:
+    """Strip control chars (except ``\\n`` and ``\\t``) and cap the length."""
+    stripped = "".join(
+        ch for ch in notes if ch in ("\n", "\t") or unicodedata.category(ch) != "Cc"
+    )
+    return stripped[:NOTES_MAX_LENGTH]
+
+
+def _validate_record(values: dict[str, str], extra: dict[str, str]) -> Record:
+    errors: list[str] = []
+    errors.extend(_validate_email(values["email"]))
+    phone_digits, phone_errors = _normalize_phone(values["phone"])
+    errors.extend(phone_errors)
+    notes = _clean_notes(values["notes"])
+    return Record(
+        customer_id=values["customer_id"],
+        region=values["region"],
+        email=values["email"],
+        phone=phone_digits,
+        notes=notes,
+        validation_status="invalid" if errors else "valid",
+        errors=errors,
+        extra=extra,
+    )
+
+
+def _partition_row(
+    row: dict[str, str | None],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Split a CSV row into schema values and the ``extra`` dict.
+
+    Schema fields go into the values dict. Reserved field names
+    (``validation_status``, ``errors``, ``extra``) are quarantined into
+    ``extra`` under ``<name>__conflict`` keys so a partner CSV cannot
+    overwrite the pipeline's computed fields (ADR 0001). Any other unknown
+    column is namespaced into ``extra`` under its own name. Unknown columns
+    are never flat-merged onto the record.
+    """
+    values: dict[str, str] = {}
+    extra: dict[str, str] = {}
+    for name, raw in row.items():
+        if name is None:
+            # DictReader yields a None key for surplus columns in rows that
+            # have more fields than the header; there is no column name to
+            # namespace under, so skip the surplus value.
+            continue
+        value = raw or ""
+        if name in SCHEMA_FIELDS:
+            values[name] = value
+        elif name in RESERVED_FIELDS:
+            extra[f"{name}__conflict"] = value
+        else:
+            extra[name] = value
+    # Ensure every schema field is present even if missing from the header.
+    for name in SCHEMA_FIELDS:
+        values.setdefault(name, "")
+    return values, extra
+
+
+# Delimiters the sniffer may choose between. Restricted so a stray character in
+# the data is not mistaken for a delimiter; comma is the default.
+_CANDIDATE_DELIMITERS = ",\t;|"
+
+
+def _detect_delimiter(contents: str) -> str:
+    """Auto-detect the CSV delimiter, defaulting to comma when uncertain.
+
+    Uses :class:`csv.Sniffer` on a leading sample. If the sample is too short
+    or the sniffer cannot determine a delimiter, comma is returned so a
+    well-formed comma file still parses.
+    """
+    sample = contents[:2048]
+    if not sample:
+        return ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=_CANDIDATE_DELIMITERS)
+    except csv.Error:
+        return ","
+    return dialect.delimiter
+
+
+def _looks_like_data_value(value: str) -> bool:
+    """Heuristic: does ``value`` look like record data, not a column name?
+
+    Column names are identifiers; record data carries an email (``@``), a phone
+    (leading ``+``), or a purely-numeric id. Used to detect a headerless file
+    whose first row :class:`csv.DictReader` would otherwise treat as the header.
+    """
+    if "@" in value:
+        return True
+    if value.startswith("+"):
+        return True
+    if value and all("0" <= ch <= "9" for ch in value):
+        return True
+    return False
+
+
+def _is_headerless(fieldnames: list[str]) -> bool:
+    """Return True if the header row looks like a data row (no header).
+
+    A real partner header carries at least one known schema column name. If none
+    of the fieldnames match the schema and at least one looks like a data value
+    (email, phone, numeric id), the file is headerless and would be silently
+    positionally mis-parsed by :class:`csv.DictReader`.
+    """
+    if any(name in SCHEMA_FIELDS for name in fieldnames):
+        return False
+    return any(_looks_like_data_value(name) for name in fieldnames)
+
+
+def _is_section_grouped(contents: str) -> bool:
+    """Return True if ``contents`` is a section-grouped CSV.
+
+    A section-grouped file's first non-blank line is a bare region label (a
+    single field with no delimiter) and the following line is a CSV header (it
+    contains a delimiter). A normal CSV's first line is the header itself, which
+    contains a delimiter.
+    """
+    lines = [ln for ln in contents.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    first_has_delim = any(d in lines[0] for d in _CANDIDATE_DELIMITERS)
+    second_has_delim = any(d in lines[1] for d in _CANDIDATE_DELIMITERS)
+    return not first_has_delim and second_has_delim
+
+
+def _split_sections(contents: str) -> list[list[str]]:
+    """Split section-grouped contents into sections of non-blank lines.
+
+    Sections are separated by one or more blank lines. Within a section, the
+    first line is the region label and the rest is a CSV with its own header.
+    """
+    sections: list[list[str]] = []
+    current: list[str] = []
+    for line in contents.splitlines():
+        if line.strip():
+            current.append(line)
+        else:
+            if current:
+                sections.append(current)
+                current = []
+    if current:
+        sections.append(current)
+    return sections
+
+
+def _read_rows(csv_text: str) -> list[dict[str, str | None]]:
+    """Read ``csv_text`` with an auto-detected delimiter.
+
+    Returns the rows. Raises :class:`BatchParseError` if the file is headerless
+    or exceeds the column cap.
+    """
+    delimiter = _detect_delimiter(csv_text)
+    reader = csv.DictReader(StringIO(csv_text), delimiter=delimiter)
+    fieldnames = reader.fieldnames
+    if fieldnames is None:
+        return []
+    fieldnames_list = list(fieldnames)
+    if _is_headerless(fieldnames_list):
+        raise BatchParseError(
+            "headerless file: first row has no recognized column names"
+        )
+    if len(fieldnames_list) > MAX_COLUMNS:
+        raise BatchParseError(
+            f"file has {len(fieldnames_list)} columns; cap is {MAX_COLUMNS}"
+        )
+    try:
+        return list(reader)
+    except csv.Error as exc:
+        # A field exceeding csv.field_size_limit (default 128 KiB) raises
+        # csv.Error mid-iteration. Surface it as a file-level parse error
+        # consistent with the delimiter-detection path, rather than crashing
+        # process_batch with a bare csv.Error.
+        raise BatchParseError(f"CSV read error: {exc}") from exc
+
+
+def _parse_records(contents: str) -> list[Record]:
+    if _is_section_grouped(contents):
+        return _parse_section_grouped(contents)
+    return _parse_flat(contents)
+
+
+def _parse_flat(contents: str) -> list[Record]:
+    records: list[Record] = []
+    for row in _read_rows(contents):
+        values, extra = _partition_row(row)
+        records.append(_validate_record(values, extra))
+    return records
+
+
+def _parse_section_grouped(contents: str) -> list[Record]:
+    """Parse a section-grouped CSV into a flat record list with ``region``.
+
+    Each section is a region label line followed by a CSV with its own header.
+    The label is preserved as the ``region`` field on every record in that
+    section, overriding any ``region`` column in the section's header (the
+    grouping is the source of truth for region).
+    """
+    records: list[Record] = []
+    for section in _split_sections(contents):
+        if len(section) < 2:
+            # A label with no header/data yields no records.
+            continue
+        region = section[0].strip()
+        csv_text = "\n".join(section[1:])
+        for row in _read_rows(csv_text):
+            values, extra = _partition_row(row)
+            values["region"] = region
+            records.append(_validate_record(values, extra))
+    return records
+
+
+def _luhn_valid(customer_id: str) -> bool:
+    """Return True if ``customer_id`` passes the Luhn checksum.
+
+    Non-digit characters are ignored; an empty digit run is not valid. The
+    algorithm is linear in the length of the id (one pass, no backtracking),
+    so a long partner-supplied id cannot hang the check.
+    """
+    digits = [int(ch) for ch in customer_id if "0" <= ch <= "9"]
+    if not digits:
+        return False
+    total = 0
+    for i, digit in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def _summarise(records: list[Record], checksum: ChecksumFn) -> Summary:
+    valid_count = sum(1 for r in records if r.validation_status == "valid")
+
+    # One entry per region in first-appearance order; OrderedDict preserves it.
+    regions: OrderedDict[str, dict[str, int]] = OrderedDict()
+    for r in records:
+        stat = regions.setdefault(r.region, {"records": 0, "valid": 0, "invalid": 0})
+        stat["records"] += 1
+        if r.validation_status == "valid":
+            stat["valid"] += 1
+        else:
+            stat["invalid"] += 1
+    per_region = [RegionStat(name=name, **counts) for name, counts in regions.items()]
+
+    return Summary(
+        total_records=len(records),
+        valid_count=valid_count,
+        invalid_count=len(records) - valid_count,
+        checksum_valid_count=sum(1 for r in records if checksum(r.customer_id)),
+        per_region=per_region,
+    )
+
+
+# --- Disk cache (parsed records + summary only) ---------------------------
+#
+# The cache key is the SHA-256 of the input file's contents; the cache file is
+# ``<cache_dir>/<sha256_hex>.json``. On a hit (the key's file is present) the
+# parsed records and summary are loaded from disk and parsing is skipped; on a
+# miss (file changed -> new hash -> new filename) the file is re-parsed and a
+# new cache entry written. The cache stores records + summary only; the report
+# is always rendered fresh against the call's template. The cache path is
+# derived from the input file's path (and the caller-supplied ``cache_dir``),
+# never from partner-supplied data (path-traversal guard per
+# practices/security-practice.md).
+
+
+def _as_file_path(source: str | os.PathLike[str]) -> Path | None:
+    """Return ``source`` as a Path if it names an existing file, else None."""
+    candidate = Path(os.fspath(source))
+    return candidate if candidate.is_file() else None
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _cache_file_path(cache_dir: Path, content_hash: str) -> Path:
+    """Resolve the cache file for ``content_hash`` within ``cache_dir``.
+
+    The filename is the hex content hash plus ``.json`` — hex digits carry no
+    path separators, so the entry cannot escape the cache directory. We resolve
+    and check containment anyway as defense-in-depth (a future naming change
+    that introduced separators would fail closed rather than write outside).
+    """
+    root = cache_dir.resolve()
+    target = (root / f"{content_hash}.json").resolve()
+    if not target.is_relative_to(root):
+        raise BatchParseError("cache path escapes cache directory")
+    return target
+
+
+def _serialize_batch(records: list[Record], summary: Summary) -> dict[str, object]:
+    return {
+        "records": [
+            {
+                "customer_id": r.customer_id,
+                "region": r.region,
+                "email": r.email,
+                "phone": r.phone,
+                "notes": r.notes,
+                "validation_status": r.validation_status,
+                "errors": list(r.errors),
+                "extra": dict(r.extra),
+            }
+            for r in records
+        ],
+        "summary": {
+            "total_records": summary.total_records,
+            "valid_count": summary.valid_count,
+            "invalid_count": summary.invalid_count,
+            "checksum_valid_count": summary.checksum_valid_count,
+            "per_region": [
+                {
+                    "name": s.name,
+                    "records": s.records,
+                    "valid": s.valid,
+                    "invalid": s.invalid,
+                }
+                for s in summary.per_region
+            ],
+        },
+    }
+
+
+def _quarantine_reserved_in_extra(extra: dict[str, str]) -> dict[str, str]:
+    """Move any reserved field names found as keys in ``extra`` to ``__conflict``.
+
+    A tampered cache (or a future serializer change) could place a reserved
+    name (``validation_status`` / ``errors`` / ``extra``) directly into
+    ``extra``. Re-assert the ADR-0001 quarantine on load so the
+    security-critical boundary is never read from disk as trusted.
+    """
+    cleaned: dict[str, str] = {}
+    for name, value in extra.items():
+        if name in RESERVED_FIELDS:
+            cleaned[f"{name}__conflict"] = value
+        else:
+            cleaned[name] = value
+    return cleaned
+
+
+def _revalidate_cached_record(r: dict[str, Any]) -> Record:
+    """Rebuild a :class:`Record` from cached JSON, recomputing the verdict.
+
+    The cached ``validation_status`` / ``errors`` are NOT trusted: an attacker
+    who can write into the cache directory could plant ``validation_status:
+    "valid"`` on a record with a bad email. We re-run the pipeline's field
+    validation on the cached raw fields so the verdict is always computed by
+    the pipeline, never read from disk. Reserved field names in ``extra`` are
+    re-quarantined under ``<name>__conflict`` (ADR 0001).
+    """
+    extra = _quarantine_reserved_in_extra(dict(r["extra"]))
+    values = {
+        "customer_id": r["customer_id"],
+        "region": r["region"],
+        "email": r["email"],
+        "phone": r["phone"],
+        "notes": r["notes"],
+    }
+    return _validate_record(values, extra)
+
+
+def _deserialize_batch(data: dict[str, Any]) -> tuple[list[Record], Summary]:
+    records: list[Record] = [_revalidate_cached_record(r) for r in data["records"]]
+    s = data["summary"]
+    summary = Summary(
+        total_records=s["total_records"],
+        valid_count=s["valid_count"],
+        invalid_count=s["invalid_count"],
+        checksum_valid_count=s["checksum_valid_count"],
+        per_region=[
+            RegionStat(
+                name=rs["name"],
+                records=rs["records"],
+                valid=rs["valid"],
+                invalid=rs["invalid"],
+            )
+            for rs in s["per_region"]
+        ],
+    )
+    return records, summary
+
+
+def _write_cache(cache_file: Path, records: list[Record], summary: Summary) -> None:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = _serialize_batch(records, summary)
+    cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _read_cache(cache_file: Path) -> tuple[list[Record], Summary]:
+    data = json.loads(cache_file.read_text(encoding="utf-8"))
+    return _deserialize_batch(data)
+
+
+def _load_or_parse(
+    input_path: Path,
+    contents: str,
+    cache_dir: Path,
+    checksum_fn: ChecksumFn,
+) -> tuple[list[Record], Summary]:
+    """Return records + summary, using the disk cache on a content-hash hit.
+
+    On a hit the parsed records and summary are loaded from disk and parsing is
+    skipped; on a miss the file is parsed and the cache written. The cached
+    ``checksum_valid_count`` is recomputed from the loaded records with the
+    call's checksum predicate, so a custom predicate is never stale on a hit.
+    Cache I/O errors are non-fatal: a corrupt or unwritable cache falls back to
+    parsing rather than failing the call.
+    """
+    content_hash = _sha256_hex(input_path.read_bytes())
+    cache_file = _cache_file_path(cache_dir, content_hash)
+
+    cached_records: list[Record] = []
+    cached_summary: Summary | None = None
+    if cache_file.is_file():
+        try:
+            cached_records, cached_summary = _read_cache(cache_file)
+        except (OSError, ValueError, KeyError, TypeError):
+            cached_summary = None
+
+    if cached_summary is not None:
+        summary = replace(
+            cached_summary,
+            checksum_valid_count=sum(
+                1 for r in cached_records if checksum_fn(r.customer_id)
+            ),
+        )
+        return cached_records, summary
+
+    records = _parse_records(contents)
+    summary = _summarise(records, checksum_fn)
+    try:
+        _write_cache(cache_file, records, summary)
+    except OSError:
+        # A failed cache write does not affect the caller's result.
+        pass
+    return records, summary
+
+
+def _template_context(records: list[Record], summary: Summary) -> dict[str, object]:
+    return {
+        "total_records": summary.total_records,
+        "valid_count": summary.valid_count,
+        "invalid_count": summary.invalid_count,
+        "checksum_valid_count": summary.checksum_valid_count,
+        "per_region": [
+            {
+                "name": r.name,
+                "records": r.records,
+                "valid": r.valid,
+                "invalid": r.invalid,
+            }
+            for r in summary.per_region
+        ],
+        # One entry per record so templates can loop with
+        # {{#records}}...{{/records}}. ``valid`` / ``invalid`` are derived
+        # booleans for conditional sections (e.g. {{#invalid}}...{{/invalid}});
+        # the remaining fields mirror the Record dataclass so the template
+        # sees exactly what the pipeline carries.
+        "records": [
+            {
+                "customer_id": r.customer_id,
+                "region": r.region,
+                "email": r.email,
+                "phone": r.phone,
+                "notes": r.notes,
+                "validation_status": r.validation_status,
+                "errors": list(r.errors),
+                "extra": dict(r.extra),
+                "valid": r.validation_status == "valid",
+                "invalid": r.validation_status == "invalid",
+            }
+            for r in records
+        ],
+    }
+
+
+def process_batch(
+    source: str | os.PathLike[str],
+    template: str | None = None,
+    *,
+    checksum: ChecksumFn | None = None,
+    cache_dir: Path | None = None,
+) -> BatchResult:
+    """Parse a partner batch file and render its summary report.
+
+    Args:
+        source: Path to a UTF-8 CSV file, or raw CSV contents. A string that
+            points at an existing file is read from disk; anything else is
+            treated as the CSV text itself.
+        template: Optional mustache template. Scalar placeholders
+            (``{{total_records}}``, ``{{valid_count}}``, ``{{invalid_count}}``,
+            ``{{checksum_valid_count}}``) are substituted; ``{{#per_region}}`` loops
+            over per-region stats (``{{name}}``, ``{{records}}``, ``{{valid}}``,
+            ``{{invalid}}``); ``{{#records}}`` loops over records (``{{customer_id}}``,
+            ``{{region}}``, ``{{email}}``, ``{{phone}}``, ``{{notes}}``,
+            ``{{validation_status}}``, ``{{errors}}``, ``{{extra}}``, plus ``{{valid}}``
+            / ``{{invalid}}`` conditionals). ``{{field}}`` HTML-escapes; ``{{{field}}}``
+            outputs raw. Defaults to a built-in summary template.
+        checksum: Optional predicate ``customer_id -> bool`` used to validate
+            each record's ``customer_id`` for ``checksum_valid_count``. Defaults
+            to the Luhn algorithm. Supply a callable so a partner's real rule
+            drops in without code changes.
+        cache_dir: Optional directory for the parsed-batch disk cache. When
+            ``source`` is an existing file, the parsed records and summary are
+            cached as JSON keyed by the SHA-256 of the file's contents: a re-run
+            on an unchanged file loads from cache and skips parsing, a changed
+            file is re-parsed and the cache overwritten. The report is always
+            rendered fresh against this call's template, so a cached file reused
+            with a different template returns the correct report. When ``None``
+            (the default) the cache lives in :data:`DEFAULT_CACHE_DIRNAME`
+            (``.batch_cache``) alongside the input file; pass a path to use a
+            different location. The cache path is derived from the input file's
+            path and ``cache_dir``, never from partner-supplied data. Caching
+            applies only when ``source`` is a file path (raw CSV contents are
+            never cached).
+
+    Returns:
+        The parsed records, summary stats, and rendered report.
+    """
+    contents = _load_contents(source)
+    checksum_fn = checksum or _luhn_valid
+
+    input_path = _as_file_path(source)
+    if input_path is not None:
+        root = (
+            cache_dir
+            if cache_dir is not None
+            else (input_path.parent / DEFAULT_CACHE_DIRNAME)
+        )
+        records, summary = _load_or_parse(input_path, contents, root, checksum_fn)
+    else:
+        records = _parse_records(contents)
+        summary = _summarise(records, checksum_fn)
+
+    report = chevron.render(
+        template or DEFAULT_TEMPLATE, _template_context(records, summary)
+    )
+    return BatchResult(records=records, summary=summary, report=report)

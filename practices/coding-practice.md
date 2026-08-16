@@ -135,6 +135,10 @@ def chunk(items: Iterable[T], size: int) -> list[list[T]]:
 
 Every exception a function can raise on its own belongs under `Raises:` — that's the one piece of the contract a type checker can't verify and a reader can't get from the signature.
 
+### A README that states what the project is, how to install it, and how to run it
+
+Three sections, minimum: what this is and who it's for, how to install it, how to run it and its tests. A public entry point added or changed in a way a user would notice belongs here — a caller who has to read `src/` to learn the entry point's name is reading the wrong file. Internal design rationale stays out; that's `docs/ARCHITECTURE.md`.
+
 ### Docstrings on the public surface, comments for the non-obvious internal step
 
 A docstring documents *what a caller can rely on*. A comment inside the body earns its place only by explaining *why* a non-obvious line exists — a workaround, a constraint from outside the function, a deliberate deviation from the obvious approach. A comment that restates the line below it in English is a no-op; delete it.
